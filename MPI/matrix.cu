@@ -1,109 +1,141 @@
-%%writefile matrix.cu
-#include <iostream>
-#include <cuda_runtime.h>
-#include <chrono>
+%%writefile phonebook_search.cpp
+#include <bits/stdc++.h>
+#include <mpi.h>
 using namespace std;
 
-__global__ void matrixMul(float *A, float *B, float *R, int M, int N, int P, int batchOffset) {
-    int k = threadIdx.x + batchOffset;   // one thread per matrix
-    if (k >= gridDim.x * blockDim.x) return;
+struct Contact {
+    string name;
+    string phone;
+};
 
-    float *a = A + k * M * N;
-    float *b = B + k * N * P;
-    float *r = R + k * M * P;
+void send_string(const string &text, int receiver) {
+    int len = text.size() + 1;
+    MPI_Send(&len, 1, MPI_INT, receiver, 1, MPI_COMM_WORLD);
+    MPI_Send(text.c_str(), len, MPI_CHAR, receiver, 1, MPI_COMM_WORLD);
+}
 
-    // compute matrix multiplication
-    for (int i = 0; i < M; i++) {
-        for (int l = 0; l < P; l++) {
-            r[i * P + l] = 0.0f;
-            for (int j = 0; j < N; j++) {
-                r[i * P + l] += a[i * N + j] * b[j * P + l];
-            }
+string receive_string(int sender) {
+    int len;
+    MPI_Recv(&len, 1, MPI_INT, sender, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    char *buf = new char[len];
+    MPI_Recv(buf, len, MPI_CHAR, sender, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    string res(buf);
+    delete[] buf;
+    return res;
+}
+
+string vector_to_string(const vector<Contact> &contacts, int start, int end) {
+    string result;
+    for (int i = start; i < min((int)contacts.size(), end); i++) {
+        result += contacts[i].name + "," + contacts[i].phone + "\n";
+    }
+    return result;
+}
+
+vector<Contact> string_to_contacts(const string &text) {
+    vector<Contact> contacts;
+    istringstream iss(text);
+    string line;
+    while (getline(iss, line)) {
+        if (line.empty()) continue;
+        int comma = line.find(",");
+        if (comma == string::npos) continue;
+        contacts.push_back({line.substr(0, comma), line.substr(comma + 1)});
+    }
+    return contacts;
+}
+
+string check(const Contact &c, const string &search) {
+    if (c.name.find(search) != string::npos) {
+        return c.name + " " + c.phone + "\n";
+    }
+    return "";
+}
+
+void read_phonebook(const vector<string> &files, vector<Contact> &contacts) {
+    for (const string &file : files) {
+        ifstream f(file);
+        string line;
+        while (getline(f, line)) {
+            if (line.empty()) continue;
+            int comma = line.find(",");
+            if (comma == string::npos) continue;
+            contacts.push_back({line.substr(1, comma - 2), line.substr(comma + 2, line.size() - comma - 3)});
         }
     }
 }
 
-// print one matrix at given index
-void printMatrixAtIndex(float *A, int index, int M, int N) {
-    int offset = index * M * N;
-    for (int i = 0; i < M; i++) {
-        for (int j = 0; j < N; j++) {
-            cout << A[offset + i * N + j] << " ";
-        }
-        cout << endl;
-    }
-}
+int main(int argc, char **argv) {
+    MPI_Init(&argc, &argv);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-int main(int argc, char* argv[]) {
-    if (argc < 6) {
-        cout << "Usage: ./matrix <threads> <k> <m> <n> <p>" << endl;
+    if (argc < 3) {
+        if (rank == 0)
+            cerr << "Usage: mpirun -n <procs> " << argv[0] << " <file>... <search>\n";
+        MPI_Finalize();
         return 1;
     }
 
-    int threads = atoi(argv[1]); // threads per block
-    int K = atoi(argv[2]);
-    int M = atoi(argv[3]);
-    int N = atoi(argv[4]);
-    int P = atoi(argv[5]);
+    string search_term = argv[argc - 1];
+    double start, end;
 
-    int sizeA = K * M * N;
-    int sizeB = K * N * P;
-    int sizeR = K * M * P;
+    if (rank == 0) {
+        vector<string> files(argv + 1, argv + argc - 1);
+        vector<Contact> contacts;
+        read_phonebook(files, contacts);
+        int total = contacts.size();
+        int chunk = (total + size - 1) / size;
 
-    // Host memory
-    float *h_A = (float*)malloc(sizeA * sizeof(float));
-    float *h_B = (float*)malloc(sizeB * sizeof(float));
-    float *h_R = (float*)malloc(sizeR * sizeof(float));
+        for (int i = 1; i < size; i++) {
+            string text = vector_to_string(contacts, i * chunk, (i + 1) * chunk);
+            send_string(text, i);
+        }
 
-    // Initialize random matrices
-    for (int i = 0; i < sizeA; i++) h_A[i] = rand() % 10;
-    for (int i = 0; i < sizeB; i++) h_B[i] = rand() % 10;
+        start = MPI_Wtime();
+        string result;
+        for (int i = 0; i < min(chunk, total); i++) {
+            string match = check(contacts[i], search_term);
+            if (!match.empty()) result += match;
+        }
+        end = MPI_Wtime();
 
-    // Device memory
-    float *d_A, *d_B, *d_R;
-    cudaMalloc(&d_A, sizeA * sizeof(float));
-    cudaMalloc(&d_B, sizeB * sizeof(float));
-    cudaMalloc(&d_R, sizeR * sizeof(float));
+        for (int i = 1; i < size; i++) {
+            string recv = receive_string(i);
+            if (!recv.empty()) result += recv;
+        }
+        
+        ofstream out("output.txt");
+        out << result;
+        out.close();
+        printf("Process %d took %f seconds.\n", rank, end - start);
 
-    cudaMemcpy(d_A, h_A, sizeA * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, h_B, sizeB * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_R, 0, sizeR * sizeof(float));
-
-    int remaining = K;
-    int batchOffset = 0;
-    while (remaining > 0) {
-        int currentBatchSize = min(remaining, threads);
-        matrixMul<<<1, currentBatchSize>>>(d_A, d_B, d_R, M, N, P, batchOffset);
-        cudaDeviceSynchronize();
-        remaining -= currentBatchSize;
-        batchOffset += currentBatchSize;
-    }
-
-    
-
-    // Copy result back
-    cudaMemcpy(h_R, d_R, sizeR * sizeof(float), cudaMemcpyDeviceToHost);
-
-    // Output
-    if (K > 9) {
-        cout << "Matrix A[9]:" << endl;
-        printMatrixAtIndex(h_A, 9, M, N);
-
-        cout << "Matrix B[9]:" << endl;
-        printMatrixAtIndex(h_B, 9, N, P);
-
-        cout << "Matrix C[9]:" << endl;
-        printMatrixAtIndex(h_R, 9, M, P);
     } else {
-        cout << "Error: K <= 9, so A[9], B[9], C[9] do not exist." << endl;
+        string recv_text = receive_string(0);
+        vector<Contact> contacts = string_to_contacts(recv_text);
+        start = MPI_Wtime();
+        string result;
+        for (auto &c : contacts) {
+            string match = check(c, search_term);
+            if (!match.empty()) result += match;
+        }
+        end = MPI_Wtime();
+        send_string(result, 0);
+        printf("Process %d took %f seconds.\n", rank, end - start);
     }
 
-    // Cleanup
-    cudaFree(d_A); cudaFree(d_B); cudaFree(d_R);
-    free(h_A); free(h_B); free(h_R);
+    MPI_Finalize();
     return 0;
 }
 
+/*
+    How to run:
+    // colab
+    !mpic++ phonebook_search.cpp -o search
+    !mpirun --allow-run-as-root -np 1 ./search phonebook1.txt Bob
 
-// !nvcc -arch=sm_75 matrix.cu -o matrix
-// !time ./matrix 400 2 2 2 2 > output.txt
+    // pc
+    mpic++ -o search phonebook_search.cpp
+    mpirun -np 4 ./search phonebook1.txt Bob
+*/
